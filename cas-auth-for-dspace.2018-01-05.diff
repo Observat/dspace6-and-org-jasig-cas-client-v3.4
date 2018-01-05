@@ -1,0 +1,704 @@
+diff --git a/dspace-api/pom.xml b/dspace-api/pom.xml
+index 4f36487..af8601b 100644
+--- a/dspace-api/pom.xml
++++ b/dspace-api/pom.xml
+@@ -738,6 +738,14 @@
+             <artifactId>jackson-annotations</artifactId>
+             <version>2.7.0</version>
+         </dependency>
++
++        <!-- CAS: Needed for CAS authentication. BEGIN -->
++        <dependency>
++            <groupId>org.jasig.cas.client</groupId>
++            <artifactId>cas-client-core</artifactId>
++            <version>3.4.1</version>
++        </dependency>
++        <!-- CAS: Needed for CAS authentication. END -->
+     </dependencies>
+ 
+ </project>
+diff --git a/dspace-api/src/main/java/org/dspace/authenticate/CASAuthentication.java b/dspace-api/src/main/java/org/dspace/authenticate/CASAuthentication.java
+new file mode 100644
+index 0000000..52bd8f2
+--- /dev/null
++++ b/dspace-api/src/main/java/org/dspace/authenticate/CASAuthentication.java
+@@ -0,0 +1,362 @@
++/**
++ * The contents of this file are subject to the license and copyright
++ * detailed in the LICENSE and NOTICE files at the root of the source
++ * tree and available online at
++ *
++ * http://www.dspace.org/license/
++ */
++package org.dspace.authenticate;
++
++import java.io.IOException;
++import java.sql.SQLException;
++import java.util.ArrayList;
++import java.util.List;
++
++import javax.servlet.ServletException;
++import javax.servlet.http.HttpServletRequest;
++import javax.servlet.http.HttpServletResponse;
++import javax.servlet.http.HttpSession;
++
++import org.apache.commons.collections.ListUtils;
++import org.apache.log4j.Logger;
++import org.dspace.authenticate.factory.AuthenticateServiceFactory;
++import org.dspace.authenticate.service.AuthenticationService;
++import org.dspace.authorize.AuthorizeException;
++import org.dspace.core.Context;
++import org.dspace.core.LogManager;
++import org.dspace.eperson.EPerson;
++import org.dspace.eperson.Group;
++import org.dspace.eperson.factory.EPersonServiceFactory;
++import org.dspace.eperson.service.EPersonService;
++import org.dspace.services.ConfigurationService;
++import org.dspace.services.factory.DSpaceServicesFactory;
++
++import org.jasig.cas.client.validation.Cas20ServiceTicketValidator;
++import org.jasig.cas.client.validation.Assertion;
++
++/**
++ * Authenticator for Central Authentication Service (CAS).
++ *
++ * @author Naveed Hashmi, University of Bristol
++ * based on code developed by Nordija A/S (www.nordija.com) for Center of Knowledge Technology (www.cvt.dk)
++ * @version $Revision: 1.0 $
++ * @author Nicolás Kovac Neumann, Universidad de La Laguna
++ * CAS authentication has been adapted to DSpace 3.1 (latest stable) and proved functionality with CAS 3.5.0
++ * @version $Revision: 1.1 $
++ * @author Tomasz Baria Boiński, Gdańsk University of Technology
++ * CAS authentication has been adapted to DSpace 4.2 and integrated with SAML user query
++ * @version $Revision 1.2 $
++ * @author Yuri Ablavatski, Sukhoi State Technical University of Gomel
++ * CAS authentication has been adapted to DSpace 6 and org.jasig.cas.client 3.4.1
++ * @version $Revision 1.3.20180103 $
++ */
++
++public class CASAuthentication
++    implements AuthenticationMethod {
++
++    /** log4j category */
++    private static Logger log = Logger.getLogger(CASAuthentication.class);
++
++    protected AuthenticationService authenticationService = AuthenticateServiceFactory.getInstance().getAuthenticationService();
++    protected ConfigurationService configurationService = DSpaceServicesFactory.getInstance().getConfigurationService();
++    protected EPersonService ePersonService = EPersonServiceFactory.getInstance().getEPersonService();
++
++    /**
++     * Predicate, can new user automatically create EPerson.
++     * Checks configuration value.  You'll probably want this to
++     * be true to take advantage of a Web certificate infrastructure
++     * with many more users than are already known by DSpace.
++     */
++    @Override
++    public boolean canSelfRegister(Context context,
++                                   HttpServletRequest request,
++                                   String username)
++        throws SQLException
++    {
++        return configurationService.getBooleanProperty("authentication-cas.webui.autoregister");
++    }
++
++    /**
++     *  Nothing extra to initialize.
++     */
++    @Override
++    public void initEPerson(Context context,
++                            HttpServletRequest request,
++                            EPerson eperson)
++        throws SQLException
++    {
++    }
++
++    /**
++     * We don't use EPerson password so there is no reason to change it.
++     */
++    @Override
++    public boolean allowSetPassword(Context context,
++                                    HttpServletRequest request,
++                                    String username)
++        throws SQLException
++    {
++        return false;
++    }
++
++    /**
++     * Predicate, is this an implicit authentication method.
++     * An implicit method gets credentials from the environment (such as
++     * an HTTP request or even Java system properties) rather than the
++     * explicit username and password.  For example, a method that reads
++     * the X.509 certificates in an HTTPS request is implicit.
++     * @return true if this method uses implicit authentication.
++     *
++     * Returns true, CAS is an implicit method
++     */
++    @Override
++    public boolean isImplicit()
++    {
++        return true;
++    }
++
++    /**
++     * No special groups.
++     */
++    @Override
++    public List<Group> getSpecialGroups(Context context, HttpServletRequest request)
++    {
++        return ListUtils.EMPTY_LIST;
++    }
++
++
++    /**
++     * CAS authentication.
++     *
++     * @return One of:
++     *   SUCCESS, BAD_CREDENTIALS, CERT_REQUIRED, NO_SUCH_USER, BAD_ARGS
++     */
++    @Override
++    public int authenticate(Context context,
++                            String username,
++                            String password,
++                            String realm,
++                            HttpServletRequest request)
++        throws SQLException
++    {
++        final String ticket = request.getParameter("ticket");
++        final String service = request.getRequestURL().toString();
++
++        if (ticket != null && ticket.startsWith("ST") )
++        {
++            try
++            {
++                // Determine CAS validation URL
++                String casServerUrl = configurationService.getProperty("authentication-cas.server.url");
++                if (casServerUrl == null)
++                {
++                    throw new ServletException("No CAS validation URL specified. You need to set property 'authentication-cas.server.url'");
++                }
++
++                // Validate ticket
++                Assertion assertion = validate( service, ticket, casServerUrl );
++                if (assertion == null)
++                {
++                    throw new ServletException("Ticket '" + ticket + "' is not valid");
++                }
++                String netid = assertion.getPrincipal().getName();
++
++                Boolean debug = configurationService.getBooleanProperty("authentication-cas.debug.enable");
++                String debug_prefix = null;
++                if( debug ) {
++                    debug_prefix = configurationService.getProperty("authentication-cas.debug.prefix");
++                    netid = debug_prefix + netid;
++                }
++
++                // Locate the eperson in DSpace
++                EPerson eperson = null;
++                try
++                {
++                    eperson = ePersonService.findByNetid(context, netid.toLowerCase());
++                }
++                catch (SQLException e)
++                {
++                    log.error("cas findbynetid failed");
++                    log.error(e.getStackTrace());
++                }
++
++                // if they entered a netd that matches an eperson and they are allowed to login
++                if (eperson != null)
++                {
++                    // e-mail address corresponds to active account
++                    if (eperson.getRequireCertificate())
++                    {
++                        // they must use a certificate
++                        return CERT_REQUIRED;
++                    }
++                    else if (!eperson.canLogIn()) {
++                        return BAD_ARGS;
++                    }
++
++                    loginWithCasAttr(context, request, eperson);
++                    return SUCCESS;
++                }
++
++                // the user does not exist in DSpace so create an eperson
++                else
++                {
++                    if (canSelfRegister(context, request, netid) )
++                    {
++                        eperson = registerNewNetidFromCAS( context, request, assertion, netid );
++
++                        loginWithCasAttr(context, request, eperson);
++                        return SUCCESS;
++                    }
++                    else
++                    {
++                        log.warn(LogManager.getHeader(context, "authenticate", netid + " type=netid_but_no_record, cannot auto-register"));
++                        return NO_SUCH_USER;
++                    }
++                }
++
++            } catch (Exception e)
++            {
++                log.error(e.getStackTrace()[0]);
++                //throw new ServletException(e);
++            }
++        }
++        return BAD_ARGS;
++    }
++
++
++    private Assertion validate(String service, String ticket, String casServerUrl)
++        throws IOException, ServletException
++    {
++        Assertion assertion = null;
++
++        Cas20ServiceTicketValidator stv = new Cas20ServiceTicketValidator( casServerUrl );
++
++        try {
++            // java.net.URLEncoder.encode(service)
++            assertion = stv.validate( ticket, service );
++        } catch (Exception e) {
++            log.error("Unexpected exception caught in Cas20ServiceTicketValidator.validate( ticket, service );", e);
++            throw new ServletException(e);
++        }
++
++        return assertion;
++    }
++
++    private void loginWithCasAttr(Context context, HttpServletRequest request, EPerson eperson )
++    {
++        HttpSession session = request.getSession(false);
++        if (session!=null) {
++          session.setAttribute("loginType", "CAS");
++        }
++
++        context.setCurrentUser(eperson);
++        log.info(LogManager.getHeader(context, "authenticate", "type=CAS"));
++    }
++
++    private EPerson registerNewNetidFromCAS(Context context, HttpServletRequest request, Assertion assertion, String netid )
++        throws SQLException, AuthorizeException
++    {
++        String firstName = (String) assertion.getPrincipal()
++                                             .getAttributes()
++                                             .get(configurationService.getProperty("authentication-cas.assertion.attributes.firstName"));
++        String lastName = (String) assertion.getPrincipal()
++                                            .getAttributes()
++                                            .get(configurationService.getProperty("authentication-cas.assertion.attributes.lastName"));
++
++        String email = null;
++        Object emails = assertion.getPrincipal().getAttributes().get(configurationService.getProperty("authentication-cas.assertion.attributes.email"));
++        if (emails instanceof ArrayList) {
++            email = (String)((ArrayList)emails).get(0);
++        } else {
++            email = (String) emails;
++            if (email.indexOf('[') == 0) {
++              email = email.substring(1, email.indexOf(','));
++            }
++        }
++        if (email == null) {
++            email = netid;
++        }
++
++        // TEMPORARILY turn off authorisation
++        // Register the new user automatically
++        //context.setIgnoreAuthorization(true);
++        context.turnOffAuthorisationSystem();
++
++        Boolean debug = configurationService.getBooleanProperty("authentication-cas.debug.enable");
++        String debug_prefix = null;
++        if( debug ) {
++            debug_prefix = configurationService.getProperty("authentication-cas.debug.prefix");
++            email = debug_prefix+email;
++            firstName = debug_prefix+firstName;
++            lastName = debug_prefix+lastName;
++        }
++
++        EPerson eperson = ePersonService.create(context);
++        eperson.setNetid(netid);
++        eperson.setLanguage(context, configurationService.getProperty("default.locale"));
++        eperson.setEmail(email);
++        eperson.setFirstName(context, firstName);
++        eperson.setLastName(context, lastName);
++        eperson.setRequireCertificate(false);
++        eperson.setSelfRegistered(false);
++
++        eperson.setCanLogIn(true);
++
++        authenticationService.initEPerson(context, request, eperson);
++
++        ePersonService.update(context, eperson);
++
++        context.commit();
++        context.restoreAuthSystemState();
++
++        return eperson;
++    }
++
++    /*
++     * Returns URL to which to redirect to obtain credentials (either password
++     * prompt or e.g. HTTPS port for client cert.); null means no redirect.
++     *
++     * @param context
++     *  DSpace context, will be modified (ePerson set) upon success.
++     *
++     * @param request
++     *  The HTTP request that started this operation, or null if not applicable.
++     *
++     * @param response
++     *  The HTTP response from the servlet method.
++     *
++     * @return fully-qualified URL
++     */
++    @Override
++    public String loginPageURL(Context context,
++                            HttpServletRequest request,
++                            HttpServletResponse response)
++    {
++        // TODO Use org.jasig.cas.client.util.CommonUtils.constructRedirectUrl() or org.jasig.cas.client.util.CommonUtils.constructServiceUrl()
++        final String authServer = configurationService.getProperty("authentication-cas.server.login.url");
++
++        StringBuffer url = new StringBuffer(authServer);
++        url.append("?service=").append(request.getScheme()).append("://").append(request.getServerName());
++        if(request.getServerPort()!=80)
++            url.append(":").append(request.getServerPort());
++        url.append(request.getContextPath()).append("/cas-login");
++
++        // Redirect to CAS server
++        return response.encodeRedirectURL(url.toString());
++    }
++
++    /*
++     * Returns message key for title of the "login" page, to use
++     * in a menu showing the choice of multiple login methods.
++     *
++     * @param context
++     *  DSpace context, will be modified (ePerson set) upon success.
++     *
++     * @return Message key to look up in i18n message catalog.
++     */
++    @Override
++    public String loginPageTitle(Context context)
++    {
++        return "org.dspace.eperson.CASAuthentication.title";
++    }
++}
+diff --git a/dspace-api/src/main/resources/Messages.properties b/dspace-api/src/main/resources/Messages.properties
+index 78ee964..800d233 100644
+--- a/dspace-api/src/main/resources/Messages.properties
++++ b/dspace-api/src/main/resources/Messages.properties
+@@ -1630,6 +1630,7 @@ org.dspace.checker.SimpleReporterImpl.store-number
+ org.dspace.checker.SimpleReporterImpl.unchecked-bitstream-report                = The following is a UN-CHECKED BITSTREAM REPORT report for
+ org.dspace.content.Collection.untitled                                          = Untitled
+ org.dspace.content.Community.untitled                                           = Untitled
++org.dspace.eperson.CASAuthentication.title                                      = Single Sign-On CAS Authentication
+ org.dspace.eperson.LDAPAuthentication.title                                     = Enter LDAP Netid and Password
+ org.dspace.eperson.PasswordAuthentication.title                                 = Enter DSpace Username and Password
+ org.dspace.eperson.X509Authentication.title                                     = Enter DSpace using Web Certificate
+diff --git a/dspace-xmlui/pom.xml b/dspace-xmlui/pom.xml
+index fb49a62..5f48c6a 100644
+--- a/dspace-xmlui/pom.xml
++++ b/dspace-xmlui/pom.xml
+@@ -258,6 +258,13 @@
+             <scope>provided</scope>
+         </dependency>
+ 
++        <!-- CAS: Needed for CAS authentication. BEGIN -->
++        <dependency>
++            <groupId>org.jasig.cas.client</groupId>
++            <artifactId>cas-client-core</artifactId>
++            <version>3.4.1</version>
++        </dependency>
++        <!-- CAS: Needed for CAS authentication. END -->
+     </dependencies>
+ 
+ </project>
+diff --git a/dspace-xmlui/src/main/java/org/dspace/app/xmlui/aspect/eperson/CASAuthenticateAction.java b/dspace-xmlui/src/main/java/org/dspace/app/xmlui/aspect/eperson/CASAuthenticateAction.java
+new file mode 100644
+index 0000000..f3e93b7
+--- /dev/null
++++ b/dspace-xmlui/src/main/java/org/dspace/app/xmlui/aspect/eperson/CASAuthenticateAction.java
+@@ -0,0 +1,119 @@
++/**
++ * The contents of this file are subject to the license and copyright
++ * detailed in the LICENSE and NOTICE files at the root of the source
++ * tree and available online at
++ *
++ * http://www.dspace.org/license/
++ */
++package org.dspace.app.xmlui.aspect.eperson;
++
++import java.sql.SQLException;
++import java.util.HashMap;
++import java.util.Map;
++
++import javax.servlet.http.HttpServletResponse;
++
++import org.apache.avalon.framework.parameters.Parameters;
++import org.apache.cocoon.acting.AbstractAction;
++import org.apache.cocoon.environment.ObjectModelHelper;
++import org.apache.cocoon.environment.Redirector;
++import org.apache.cocoon.environment.Request;
++import org.apache.cocoon.environment.SourceResolver;
++import org.apache.cocoon.environment.http.HttpEnvironment;
++import org.apache.cocoon.sitemap.PatternException;
++import org.dspace.app.xmlui.utils.AuthenticationUtil;
++import org.dspace.core.Context;
++import org.dspace.eperson.EPerson;
++import org.dspace.services.factory.DSpaceServicesFactory;
++
++/*
++ * @author Kaboré Wendin-Malegdé Patrick at Paris-Dauphine University
++ * * @version $Revision: 1.0 $
++ * @author Yuri Ablavatski, Sukhoi State Technical University of Gomel
++ * CAS authentication has been adapted to DSpace 6
++ * @version $Revision 1.3.20180103 $
++ */
++
++/**
++ * Attempt to authenticate the user based upon their presented CAS credentials.
++ * This action uses the http parameters as supplied by CAS server.
++ * Read dspace.cfg for configuration detail.
++ *
++ * If the authentication attempt is successfull then an HTTP redirect will be
++ * sent to the browser redirecting them to their original location in the
++ * system before authenticated or if none is supplied back to the DSpace
++ * homepage. The action will also return true, thus contents of the action will
++ * be excuted.
++ *
++ * If the authentication attempt fails, the action returns false.
++ *
++ * Example use:
++ *
++ * <map:act name="Authenticate">
++ *   <map:serialize type="xml"/>
++ * </map:act>
++ * <map:transform type="try-to-login-again-transformer">
++ *
++ * @author Scott Phillips
++ */
++
++public class CASAuthenticateAction extends AbstractAction
++{
++
++    /**
++     * Attempt to authenticate the user.
++     */
++    public Map act(Redirector redirector, SourceResolver resolver, Map objectModel,
++            String source, Parameters parameters) throws Exception
++    {
++        // First check if we are preforming a new login
++        Request request = ObjectModelHelper.getRequest(objectModel);
++
++        try
++        {
++            Context context = AuthenticationUtil.authenticate(objectModel, null,null, null);
++
++            EPerson eperson = context.getCurrentUser();
++
++            if (eperson != null)
++            {
++                // The user has successfully logged in
++                String redirectURL = request.getContextPath();
++
++                if (AuthenticationUtil.isInterupptedRequest(objectModel))
++                {
++                    // Resume the request and set the redirect target URL to
++                    // that of the originaly interrupted request.
++                    redirectURL += AuthenticationUtil.resumeInterruptedRequest(objectModel);
++                }
++                else
++                {
++                    // Otherwise direct the user to the login page
++                    String loginRedirect = DSpaceServicesFactory.getInstance().getConfigurationService().getProperty("xmlui.user.loginredirect");
++                    redirectURL += (loginRedirect != null) ? loginRedirect.trim() : "";
++                }
++
++                // Authentication successfull send a redirect.
++                final HttpServletResponse httpResponse = (HttpServletResponse) objectModel.get(HttpEnvironment.HTTP_RESPONSE_OBJECT);
++
++                httpResponse.sendRedirect(redirectURL);
++
++                // log the user out for the rest of this current request, however they will be reauthenticated
++                // fully when they come back from the redirect. This prevents caching problems where part of the
++                // request is preformed fore the user was authenticated and the other half after it succedded. This
++                // way the user is fully authenticated from the start of the request.
++                context.setCurrentUser(null);
++
++                return new HashMap();
++            }
++        }
++        catch (SQLException sqle)
++        {
++            throw new PatternException("Unable to preform authentication",
++                    sqle);
++        }
++
++        return null;
++    }
++
++}
+diff --git a/dspace-xmlui/src/main/java/org/dspace/app/xmlui/aspect/eperson/UnAuthenticateAction.java b/dspace-xmlui/src/main/java/org/dspace/app/xmlui/aspect/eperson/UnAuthenticateAction.java
+index 8e02154..01651d4 100644
+--- a/dspace-xmlui/src/main/java/org/dspace/app/xmlui/aspect/eperson/UnAuthenticateAction.java
++++ b/dspace-xmlui/src/main/java/org/dspace/app/xmlui/aspect/eperson/UnAuthenticateAction.java
+@@ -12,6 +12,7 @@ import java.util.Map;
+ 
+ import javax.servlet.http.HttpServletRequest;
+ import javax.servlet.http.HttpServletResponse;
++import javax.servlet.http.HttpSession;
+ 
+ import org.apache.avalon.framework.parameters.Parameters;
+ import org.apache.cocoon.acting.AbstractAction;
+@@ -79,21 +80,44 @@ public class UnAuthenticateAction extends AbstractAction
+         
+         // Set the user as logged in for the rest of this request so that the cache does not get spoiled.
+         context.setCurrentUser(eperson);
+-        
+-        // Forward the user to the home page.
++
+         ConfigurationService configurationService
+                 = DSpaceServicesFactory.getInstance().getConfigurationService();
+-        if((configurationService.getBooleanProperty("xmlui.public.logout"))
++
++        // Redirect users to their logout page
++        HttpSession session = httpRequest.getSession(false);
++        String loginType = null;
++        if (session != null) {
++            loginType = (String) session.getAttribute("loginType");
++        }
++
++        // Special logout if we're using CAS
++        // The ?url parameter may vary depending on CAS version, could be ?service instead
++        if (loginType != null && loginType.equals("CAS")) {
++            StringBuffer location = new StringBuffer();
++            // TODO Use org.jasig.cas.client.util.CommonUtils.constructRedirectUrl() or org.jasig.cas.client.util.CommonUtils.constructServiceUrl()
++            location.append(configurationService.getProperty("authentication-cas.server.logout.url"))
++                    .append("?url=http://")
++                    .append(httpRequest.getServerName())
++                    .append(":")
++                    .append(httpRequest.getServerPort())
++                    .append(httpRequest.getContextPath());
++            httpResponse.sendRedirect(location.toString());
++        }
++        else {
++          // Forward the user to the home page.
++          if((configurationService.getBooleanProperty("xmlui.public.logout"))
+                 && (httpRequest.isSecure())) {
+ 				StringBuffer location = new StringBuffer("http://");
+ 				location.append(configurationService.getProperty("dspace.hostname"))
+                         .append(httpRequest.getContextPath());
+ 				httpResponse.sendRedirect(location.toString());
+ 		}
+-        else{
++          else {
+             httpResponse.sendRedirect(configurationService.getProperty("dspace.url"));
++          }
+         }
+-        
++
+         return new HashMap();
+     }
+ 
+diff --git a/dspace-xmlui/src/main/resources/aspects/EPerson/sitemap.xmap b/dspace-xmlui/src/main/resources/aspects/EPerson/sitemap.xmap
+index 1e16419..d6abaff 100644
+--- a/dspace-xmlui/src/main/resources/aspects/EPerson/sitemap.xmap
++++ b/dspace-xmlui/src/main/resources/aspects/EPerson/sitemap.xmap
+@@ -42,6 +42,7 @@ registration, forgotten passwords, editing profiles, and changing passwords.
+ 			<map:action name="AuthenticateAction" src="org.dspace.app.xmlui.aspect.eperson.AuthenticateAction"/>
+ 			<map:action name="ShibbolethAction" src="org.dspace.app.xmlui.aspect.eperson.ShibbolethAction"/>
+ 			<map:action name="LDAPAuthenticateAction" src="org.dspace.app.xmlui.aspect.eperson.LDAPAuthenticateAction"/>
++                        <map:action name="CASAuthenticateAction" src="org.dspace.app.xmlui.aspect.eperson.CASAuthenticateAction"/>
+ 			<map:action name="UnAuthenticateAction" src="org.dspace.app.xmlui.aspect.eperson.UnAuthenticateAction"/>
+ 			<map:action name="LoginRedirect" src="org.dspace.app.xmlui.aspect.eperson.LoginRedirect" />
+ 		</map:actions>
+@@ -185,6 +186,17 @@ registration, forgotten passwords, editing profiles, and changing passwords.
+ 				<map:serialize type="xml"/>
+ 			</map:match>
+ 			
++			<map:match pattern="cas-login">
++				<map:act type="CASAuthenticateAction">
++					<!-- Loggin succeeded, request will be forwarded. -->
++					<map:serialize type="xml"/>
++				</map:act>
++
++				<!-- Login failed, try again. -->
++				<map:transform type="FailedAuthentication"/>
++				<map:serialize type="xml"/>
++			</map:match>
++
+ 			<!--
+ 					Log the user out. The UnAuthenticateAction can not fail and will 
+ 					always redirect the user to the DSpace homepage.
+diff --git a/dspace-xmlui/src/main/webapp/i18n/messages.xml b/dspace-xmlui/src/main/webapp/i18n/messages.xml
+index bd8d0ad..9e54855 100644
+--- a/dspace-xmlui/src/main/webapp/i18n/messages.xml
++++ b/dspace-xmlui/src/main/webapp/i18n/messages.xml
+@@ -2503,5 +2503,7 @@
+     <message key="xmlui.Submission.submit.StartSubmissionLookupStep.submit_publication_item">Imported publication Record</message>
+     <message key="xmlui.Submission.submit.progressbar.lookup">Lookup</message>
+ 
++    <!-- CAS -->
++    <message key="xmlui.EPerson.EditProfile.netid">Single Sign-On Username</message>
+ 
+ </catalogue>
+diff --git a/dspace/config/dspace.cfg b/dspace/config/dspace.cfg
+index afdc496..0d87555 100644
+--- a/dspace/config/dspace.cfg
++++ b/dspace/config/dspace.cfg
+@@ -1999,6 +1999,7 @@ module_dir = modules
+ 
+ include = ${module_dir}/altmetrics.cfg
+ include = ${module_dir}/authentication.cfg
++include = ${module_dir}/authentication-cas.cfg
+ include = ${module_dir}/authentication-ip.cfg
+ include = ${module_dir}/authentication-ldap.cfg
+ include = ${module_dir}/authentication-password.cfg
+diff --git a/dspace/config/log4j.properties b/dspace/config/log4j.properties
+index 238d0d8..701a448 100644
+--- a/dspace/config/log4j.properties
++++ b/dspace/config/log4j.properties
+@@ -101,6 +101,14 @@ log4j.appender.A3.layout=org.apache.log4j.PatternLayout
+ log4j.appender.A3.layout.ConversionPattern=%d %-5p %c %x - %m%n
+ 
+ 
++log4j.logger.org.jasig = DEBUG, A4
++log4j.appender.A4=org.dspace.app.util.DailyFileAppender
++log4j.appender.A4.File=${log.dir}/cas.log
++log4j.appender.A4.DatePattern=yyyy-MM-dd
++log4j.appender.A4.MaxLogs=14
++log4j.appender.A4.layout=org.apache.log4j.PatternLayout
++log4j.appender.A4.layout.ConversionPattern=%d %-5p %c %x - %m%n
++
+ ###########################################################################
+ # Other settings
+ ###########################################################################
+diff --git a/dspace/config/modules/authentication-cas.cfg b/dspace/config/modules/authentication-cas.cfg
+new file mode 100644
+index 0000000..f1348a6
+--- /dev/null
++++ b/dspace/config/modules/authentication-cas.cfg
+@@ -0,0 +1,21 @@
++## CAS options
++
++authentication-cas.debug.enable = true
++authentication-cas.debug.prefix = t10_
++
++authentication-cas.assertion.attributes.email = mail
++authentication-cas.assertion.attributes.firstName = givenName
++authentication-cas.assertion.attributes.lastName = sn
++
++authentication-cas.server.url = https://cas.dev.gstu.by/
++authentication-cas.server.login.url = https://cas.dev.gstu.by/login
++authentication-cas.server.logout.url = https://cas.dev.gstu.by/logout
++
++
++## Create e-persons for no matching user in dspace
++# If set to false, no new users will be allowed to create account on first authentication!
++authentication-cas.webui.autoregister = true
++
++# if webui.cas.enable =  true, you can edit the CAS username on the EPerson page.
++# Value "true" is not supported. Support see in path for dspace5
++authentication-cas.webui.cas.enable = false
